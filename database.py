@@ -1,5 +1,5 @@
 import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, Boolean, desc
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql import extract
@@ -15,7 +15,7 @@ class User(Base):
     channel_name = Column(String, nullable=False)
     points = Column(Integer, default=0)
     last_long_video_sent = Column(DateTime, nullable=True)
-    is_admin = Column(Boolean, default=False)
+    last_activity = Column(DateTime, default=datetime.datetime.now) # لتتبع آخر نشاط للمستخدم
     registration_date = Column(DateTime, default=datetime.datetime.now)
 
     def __repr__(self):
@@ -74,6 +74,15 @@ class Database:
         session.commit()
         session.close()
         self.update_user_points(user_id, points)
+        self.update_last_activity(user_id) # تحديث آخر نشاط
+
+    def update_last_activity(self, user_id: int):
+        session = self.get_session()
+        user = session.query(User).filter_by(user_id=user_id).first()
+        if user:
+            user.last_activity = datetime.datetime.now()
+            session.commit()
+        session.close()
 
     def get_today_videos_count(self, user_id: int, video_type: str):
         session = self.get_session()
@@ -93,7 +102,19 @@ class Database:
         count = session.query(Video).filter(
             Video.user_id == user_id,
             Video.type == video_type,
-            Video.sent_at >= start_of_week
+            Video.sent_at >= start_of_week.strftime('%Y-%m-%d 00:00:00') # التأكد من التوقيت
+        ).count()
+        session.close()
+        return count
+
+    def get_monthly_videos_count(self, user_id: int, video_type: str):
+        session = self.get_session()
+        today = datetime.date.today()
+        start_of_month = today.replace(day=1)
+        count = session.query(Video).filter(
+            Video.user_id == user_id,
+            Video.type == video_type,
+            Video.sent_at >= start_of_month.strftime('%Y-%m-%d 00:00:00')
         ).count()
         session.close()
         return count
@@ -139,7 +160,7 @@ class Database:
 
     def get_all_videos(self):
         session = self.get_session()
-        videos = session.query(Video).all()
+        videos = session.query(Video).order_by(Video.sent_at.desc()).all() # ترتيب حسب الأحدث
         session.close()
         return videos
 
@@ -154,3 +175,66 @@ class Database:
         count = session.query(Video).filter_by(user_id=user_id, type='long').count()
         session.close()
         return count
+
+    def get_last_video_sent_details(self, user_id: int):
+        session = self.get_session()
+        last_video = session.query(Video).filter_by(user_id=user_id).order_by(desc(Video.sent_at)).first()
+        session.close()
+        return last_video
+
+    def get_videos_for_user_in_period(self, user_id: int, start_date: datetime.date, end_date: datetime.date):
+        session = self.get_session()
+        videos = session.query(Video).filter(
+            Video.user_id == user_id,
+            func.DATE(Video.sent_at) >= start_date,
+            func.DATE(Video.sent_at) <= end_date
+        ).all()
+        session.close()
+        return videos
+
+    def get_users_by_activity_in_period(self, start_date: datetime.date, end_date: datetime.date):
+        session = self.get_session()
+        # جلب جميع المستخدمين
+        all_users = session.query(User).all()
+        
+        users_data = []
+        for user in all_users:
+            short_videos_count = session.query(Video).filter(
+                Video.user_id == user.user_id,
+                Video.type == 'short',
+                func.DATE(Video.sent_at) >= start_date,
+                func.DATE(Video.sent_at) <= end_date
+            ).count()
+            
+            long_videos_count = session.query(Video).filter(
+                Video.user_id == user.user_id,
+                Video.type == 'long',
+                func.DATE(Video.sent_at) >= start_date,
+                func.DATE(Video.sent_at) <= end_date
+            ).count()
+
+            points_earned = session.query(func.sum(Video.points_earned)).filter(
+                Video.user_id == user.user_id,
+                func.DATE(Video.sent_at) >= start_date,
+                func.DATE(Video.sent_at) <= end_date
+            ).scalar() or 0
+            
+            # تاريخ تسجيل المستخدم
+            registration_date_str = user.registration_date.strftime('%Y-%m-%d %H:%M')
+
+            # التحقق مما إذا كان المستخدم قد أرسل أي فيديوهات خلال الفترة
+            has_activity_in_period = (short_videos_count > 0 or long_videos_count > 0)
+
+            users_data.append({
+                'user': user,
+                'short_videos_count': short_videos_count,
+                'long_videos_count': long_videos_count,
+                'points_earned': points_earned,
+                'registration_date_str': registration_date_str,
+                'has_activity_in_period': has_activity_in_period
+            })
+        
+        # الترتيب حسب النقاط المكتسبة في هذه الفترة تنازلياً
+        users_data.sort(key=lambda x: x['points_earned'], reverse=True)
+        session.close()
+        return users_data
